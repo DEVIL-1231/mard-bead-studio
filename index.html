@@ -871,6 +871,9 @@ function convertImage(){
   const bgBlank = $("bgBlank").checked;    // 背景留白：近白像素不铺豆
   const ditherOn = $("ditherFx").checked;  // 颜色抖动：渐变过渡更自然
   const nonWhitePool = PALETTE.map((_, i) => i).filter(i => !PAL_NEAR_WHITE[i]);
+  /* 0) 同步输入框中的画布尺寸（未点“应用”时自动应用，保证按输入尺寸转换） */
+  const wantN = clamp(parseInt($("sizeInput").value, 10) || N, 4, 100);
+  if (wantN !== N) setSize(wantN);
 
   /* 1) 将参考图等比适配绘制到 N×N 采样画布 */
   const c = document.createElement("canvas");
@@ -1126,7 +1129,7 @@ function syncRulerLayout(){ assembly.classList.toggle("no-ruler", !showRulers); 
 
 function bindEvents(){
   /* 尺寸 */
-  bindNumLimit($("sizeInput"), 4, 100);
+  bindNumLimit($("sizeInput"), 4, 100, v => { if (v !== N) setSize(v); }); // 回车/失焦自动应用
   $("btnApplySize").addEventListener("click", () => setSize(+$("sizeInput").value));
   document.querySelectorAll("#presetBox .btn").forEach(b =>
     b.addEventListener("click", () => setSize(+b.dataset.size)));
