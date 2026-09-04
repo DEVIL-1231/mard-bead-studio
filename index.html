@@ -324,7 +324,14 @@ input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer;height:18
         <input type="number" id="maxColor" min="2" max="32" step="1" value="16">
       </div>
     </div>
+    <div class="switch-row" style="margin:9px 0">
+      <label class="switch"><input type="checkbox" id="bgBlank" checked><span class="track"></span><span class="txt">背景留白</span></label>
+      <label class="switch"><input type="checkbox" id="ditherFx"><span class="track"></span><span class="txt">颜色抖动</span></label>
+    </div>
     <button class="btn primary" id="btnConvert" style="width:100%" disabled>⚡ 一键转为拼豆图纸</button>
+    <div style="font-size:10px;color:var(--muted-2);margin-top:7px;line-height:1.7">
+      留白＝白色区域不铺豆；抖动让水彩渐变更自然；<br>人物类图片建议最大用色 24~32、尺寸 80 以上
+    </div>
   </div>
 
   <!-- 导出与工程 -->
@@ -861,6 +868,10 @@ function convertImage(){
   if (!refImg) return;
   const maxK = clamp(parseInt($("maxColor").value, 10) || 16, 2, 32);
   $("maxColor").value = maxK;
+  const bgBlank = $("bgBlank").checked;    // 背景留白：近白像素不铺豆
+  const ditherOn = $("ditherFx").checked;  // 颜色抖动：渐变过渡更自然
+  const nonWhitePool = PALETTE.map((_, i) => i).filter(i => !PAL_NEAR_WHITE[i]);
+
   /* 1) 将参考图等比适配绘制到 N×N 采样画布 */
   const c = document.createElement("canvas");
   c.width = N; c.height = N;
@@ -875,42 +886,80 @@ function convertImage(){
   const px = new Array(N * N);
   for (let i = 0; i < N * N; i++) px[i] = [data[i * 4], data[i * 4 + 1], data[i * 4 + 2]];
 
-  /* 2) 第一遍：全色板欧式距离匹配 */
-  let idxs = px.map(p => matchColor(p)[0]);
-
-  /* 3) 白色优化：统计纯白占比，过高时把“非纯白”的浅色像素改配到近白色号，
-        避免照片/底图大面积被识别成 H1 白色 */
-  let whiteCnt = 0;
-  for (const v of idxs) if (v === WHITE_IDX) whiteCnt++;
-  const whiteRatio = whiteCnt / idxs.length;
-  const nonWhitePool = PALETTE.map((_, i) => i).filter(i => !PAL_NEAR_WHITE[i]);
-  if (whiteRatio > 0.12 && nonWhitePool.length){
-    idxs = idxs.map((v, i) => {
-      if (v !== WHITE_IDX) return v;
-      const [r, g, b] = px[i];
-      if (r > 248 && g > 248 && b > 248) return WHITE_IDX;   // 真·纯白保留
-      const [bi, bd] = matchColor(px[i], nonWhitePool);       // 近白偏色 -> 奶白/米色系
-      const [, wd] = matchColor(px[i]);
-      return bd <= wd * 3.5 ? bi : WHITE_IDX;
-    });
+  /* 2) 背景留白标记：近白像素转为空格（不铺豆） */
+  const blank = new Uint8Array(N * N);
+  if (bgBlank){
+    for (let i = 0; i < px.length; i++){
+      const p = px[i];
+      if (p[0] > 232 && p[1] > 232 && p[2] > 232) blank[i] = 1;
+    }
   }
 
-  /* 4) 最大用色数限制：取用量前 K 色，全部像素在这 K 色内重新匹配 */
+  /* 3) 颜色量化：可选 Floyd–Steinberg 抖动（误差扩散让渐变更细腻） */
+  const idxs = new Array(N * N).fill(-1);
+  if (ditherOn){
+    const pool = bgBlank ? nonWhitePool : null;   // 留白模式下白色系交给留白逻辑处理
+    const err = new Float32Array(N * N * 3);      // RGB 误差累积表
+    const spread = (xx, yy, r, g, b, w) => {
+      if (xx < 0 || xx >= N || yy >= N) return;
+      const j = yy * N + xx;
+      if (blank[j]) return;
+      err[j * 3] += r * w; err[j * 3 + 1] += g * w; err[j * 3 + 2] += b * w;
+    };
+    for (let y = 0; y < N; y++){
+      for (let x = 0; x < N; x++){
+        const i = y * N + x;
+        if (blank[i]) continue;
+        const r = clamp(Math.round(px[i][0] + err[i * 3]), 0, 255);
+        const g = clamp(Math.round(px[i][1] + err[i * 3 + 1]), 0, 255);
+        const b = clamp(Math.round(px[i][2] + err[i * 3 + 2]), 0, 255);
+        const [mi] = matchColor([r, g, b], pool);
+        idxs[i] = mi;
+        const pr = PAL_RGB[mi];
+        const er = r - pr[0], eg = g - pr[1], eb = b - pr[2];
+        spread(x + 1, y,     er, eg, eb, 7 / 16);
+        spread(x - 1, y + 1, er, eg, eb, 3 / 16);
+        spread(x,     y + 1, er, eg, eb, 5 / 16);
+        spread(x + 1, y + 1, er, eg, eb, 1 / 16);
+      }
+    }
+  } else {
+    for (let i = 0; i < N * N; i++) if (!blank[i]) idxs[i] = matchColor(px[i])[0];
+  }
+
+  /* 4) 白色优化：纯白占比过高时，把“非纯白”的浅色像素改配到近白色号，
+        避免照片/底图大面积被识别成 H1 白色（留白像素不参与统计） */
+  let whiteCnt = 0, filledCnt = 0;
+  for (let i = 0; i < idxs.length; i++) if (idxs[i] >= 0){ filledCnt++; if (idxs[i] === WHITE_IDX) whiteCnt++; }
+  if (filledCnt && whiteCnt / filledCnt > 0.12 && nonWhitePool.length){
+    const wp = PAL_RGB[WHITE_IDX];
+    for (let i = 0; i < idxs.length; i++){
+      if (idxs[i] !== WHITE_IDX) continue;
+      const [r, g, b] = px[i];
+      if (r > 248 && g > 248 && b > 248) continue;            // 真·纯白保留
+      const [bi, bd] = matchColor(px[i], nonWhitePool);        // 近白偏色 -> 奶白/米色系
+      const wd = (r - wp[0]) ** 2 + (g - wp[1]) ** 2 + (b - wp[2]) ** 2;
+      if (bd <= wd * 3.5) idxs[i] = bi;
+    }
+  }
+
+  /* 5) 最大用色数限制：取用量前 K 色，全部像素在这 K 色内重新匹配 */
   const freq = new Map();
-  for (const v of idxs) freq.set(v, (freq.get(v) || 0) + 1);
+  for (const v of idxs) if (v >= 0) freq.set(v, (freq.get(v) || 0) + 1);
   let used = [...freq.keys()];
   if (used.length > maxK){
     used = used.sort((a, b) => freq.get(b) - freq.get(a)).slice(0, maxK);
-    idxs = px.map(p => matchColor(p, used)[0]);
+    for (let i = 0; i < idxs.length; i++) if (!blank[i]) idxs[i] = matchColor(px[i], used)[0];
   }
 
-  /* 5) 写入网格（单步历史，可一键撤销） */
+  /* 6) 写入网格（单步历史，可一键撤销；留白格为 -1） */
   pushHist();
   let k = 0;
   for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) grid[y][x] = idxs[k++];
   renderAll();
-  const finalColors = new Set(idxs).size;
-  toast(`转换完成：使用 ${finalColors} 色 / 共 ${N * N} 颗豆`);
+  const beads = filledCnt;
+  const finalColors = new Set(used).size;
+  toast(`转换完成：${finalColors} 色 / ${beads} 颗豆` + (bgBlank ? `（留白 ${N * N - beads} 格）` : ""));
 }
 
 /* ============================================================
